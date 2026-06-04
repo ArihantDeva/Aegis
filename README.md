@@ -1,13 +1,34 @@
 # Aegis - off-screen, hardened computer-use
 
-Everything that would otherwise drive the **host** screen, cursor, focus, or your
-real browser runs **here** instead. Web tasks run in an ephemeral, capability-dropped
-Docker container; native-macOS-app tasks run in an isolated Tart VM. The host display
-is never touched and never interrupted. Aegis ships as a single CLI, `sandbox`.
+**Run AI agents and browser automation without letting them touch your real machine.**
 
-The container is the security boundary: every run is unprivileged, capability-dropped,
-resource-bounded, and ephemeral, with controlled egress, so automation can drive a
-browser without ever reaching the host screen or the host network.
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue.svg)](#)
+[![Security: 4-round audit](https://img.shields.io/badge/security-4--round%20audit-success.svg)](docs/security-audit-2026-06.md)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#)
+[![GitHub stars](https://img.shields.io/github/stars/ArihantDeva/Aegis?style=social)](https://github.com/ArihantDeva/Aegis/stargazers)
+
+"Computer use" agents drive a real browser and a real cursor. Point one at the open
+web and it runs with **your** logged-in sessions, **your** filesystem, and **your**
+network, one prompt injection away from taking over your desktop or quietly
+exfiltrating your cookies.
+
+**Aegis moves all of it off the host.** Web tasks run in an ephemeral,
+capability-dropped Docker container; native-macOS-app tasks run in an isolated Tart
+VM. The host display is never touched and never interrupted. Aegis ships as a single
+CLI, `sandbox`.
+
+- **Off-screen by construction** - headless by default; *watch* a live run at
+  `localhost:6080` if you want, but it never steals your screen or focus.
+- **Locked down** - non-root, `--cap-drop ALL` (verified `CapEff=0`),
+  `no-new-privileges`, pids/memory/cpu caps, ephemeral `--rm`, optional immutable rootfs.
+- **Default-deny egress** - `--allow github.com,api.example.com` puts the browser on
+  an internal network whose only exit is a proxy that refuses every other host;
+  `--offline` removes networking entirely.
+- **Batteries included (all opt-in)** - undetected-Chromium and undetectable-Firefox
+  stealth engines, an LLM "give it a goal" agent, document-to-Markdown, fingerprint-true
+  HTTP, load testing, and accessibility audits, none of which can regress the proven
+  default path.
 
 ## Layout
 
