@@ -1,0 +1,12 @@
+# hadolint configuration for the sandbox Dockerfiles (read by `sandbox
+# lint-dockerfile`, which mounts this file at /.hadolint.yaml in the linter
+# container). List a DL####/SC#### under `ignored` only when a violation is
+# intentional and documented.
+ignored:
+  # DL3008 (pin apt versions): intentionally NOT pinned. The image rides
+  # debian-bookworm-slim's security-patched package set; pinning exact apt
+  # versions on a rolling, patched base is an anti-pattern -- the pinned
+  # version is dropped from the mirror on the next security update and breaks
+  # `docker build`. We accept floating apt versions for chromium + the display
+  # stack + curl.
+  - DL3008

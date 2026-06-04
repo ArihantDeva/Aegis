@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# sandbox — hardened, off-screen computer-use runtime.
+#
+# Everything that would otherwise drive the real macOS screen or the user's real
+# Chrome runs here instead: an ephemeral, capability-dropped, resource-capped
+# Docker container (web tasks) or an isolated Tart macOS VM (native-app tasks).
+# Nothing it does touches the host display, focus, or the user's browser session.
+#
+# Usage:
+#   sandbox build                       Build the browser + egress images
+#   sandbox run [opts] --recipe R       Run a recipe (R = path | inline JSON | -)
+#   sandbox agent [opts] "<goal>"      LLM-driven: describe a goal, agent does it
+#   sandbox cf-get [opts] <url>        Fetch a Cloudflare-protected URL (FlareSolverr)
+#   sandbox convert [opts] <file>      Document -> Markdown (PDF/Office/...; markitdown)
+#   sandbox fetch-media [opts] <url>   Download audio/video/subs from URL (yt-dlp)
+#   sandbox fetch-impersonate [o] <url> Fetch with a real-browser TLS/JA3 fingerprint (curl_cffi)
+#   sandbox load [opts] <url>          HTTP load test: rate/duration -> latency percentiles (vegeta)
+#   sandbox spider [opts] <url>        Crawl a site: discover feeds/sitemaps, return URLs
+#   sandbox observe [opts]              Long-lived container; watch at noVNC URL
+#   sandbox shell [opts]               Debug shell inside the hardened container
+#   sandbox stop                       Tear down observe/proxy/cf containers + nets
+#   sandbox doctor                     Check docker / image / tart readiness
+#   sandbox lint-dockerfile            Lint Dockerfiles for hardening anti-patterns (hadolint)
+#   sandbox vm <...>                   Delegate to the Tart macOS-VM wrapper
+#
+# Network opts (default = full bridge internet):
+#   --offline                          --network none (no egress at all)
+#   --allow d1,d2,...                  Default-DENY egress; allow only these domains
+# Capability opts:
+#   --stealth                          Use the patchright anti-detection engine
+#   --camoufox                         Use the Camoufox undetectable-Firefox engine
+#   --trace                            Record a Playwright trace.zip into /work
+#   --har                              Record network.har into /work
+#   --video                            Record a .webm of the run into /work
+#   --readonly                         Read-only root fs (max isolation) + tmpfs
+#   --circuit-breaker                  Per-domain circuit breaker (pybreaker): after
+#                                      3 consecutive navigate failures to a host, open
+#                                      the circuit and fast-fail that host for 300 s.
+#                                      State persists across runs in the profile volume.
+# fetch-media opts (in addition to --work, --allow, --offline, --mem, --cpus):
+#   --format audio|video|best          Stream type to download (default: best)
+#   --write-auto-subs                  Also grab auto-generated captions when native subs absent
+#   --skip-download                    Metadata + subtitles only; no A/V file
+# fetch-impersonate opts (in addition to --work, --allow, --offline, --mem, --cpus):
+#   --impersonate chrome120|...        Browser TLS/JA3 profile to mimic (default: chrome120)
+#   --method GET|POST|...              HTTP method (default: GET)
+#   --header K:V                       Extra request header; repeatable
+#   --body STR                         Raw request body
+#   --timeout N                        Request timeout seconds (default: 30)
+# load opts (in addition to --work, --allow, --offline, --mem, --cpus):
+#   --rate N                           Requests per second (default: 10)
+#   --duration N                       Attack duration seconds (default: 10)
+#   --method GET|POST|...              HTTP method (default: GET)
+# Other opts:
+#   --observe                          Headed run + noVNC view on :6080
+#   --work DIR                         Host dir mounted at /work for screenshots
+#   --profile NAME                     Isolated persistent profile (default: default)
+#   --mem 2g  --cpus 2                 Resource caps (defaults shown)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="claude-sandbox-browser"
+PROXY_IMAGE="claude-sandbox-egress"
+PROFILE_VOL="sandbox-profile"
+NET_INT="sandbox-int"
+NET_EXT="sandbox-ext"
+PROXY_NAME="sandbox-proxy"
+OBSERVE_NAME="sandbox-observe"
+
+MEM="2g"; CPUS="2"; MODE="headless"; NET="bridge"; ALLOW=""; WORK=""; RECIPE=""
+NOVNC_PORT="6080"; PROFILE_NAME="default"
+# Opt-in capability switches (all OFF by default — the proven path is untouched).
+STEALTH="0"; TRACE="0"; HAR="0"; VIDEO="0"; READONLY="0"; ENGINE=""; CIRCUIT_BREAKER="0"
+CF_NAME="sandbox-cf"; CF_IMAGE="ghcr.io/flaresolverr/flaresolverr:v3.5.0"; CF_PORT="8191"
+
+die(){ echo "sandbox: $*" >&2; exit 1; }
+have_docker(){ docker info >/dev/null 2>&1 || die "Docker daemon is not running. Start Docker Desktop (open -a Docker)."; }
+
+# Hardening flags applied to EVERY container run. Populates global array HF.
+# Built as a plain array (no mapfile) so it works on macOS's stock Bash 3.2.
+build_hard_flags(){
+  HF=(
+    --cap-drop ALL
+    --security-opt no-new-privileges
+    --pids-limit 512
+    --memory "$MEM" --memory-swap "$MEM"
+    --cpus "$CPUS"
+    --shm-size 1g
+    --tmpfs /tmp:rw,nosuid,nodev,size=256m
+  )
+  # --readonly: immutable root filesystem. The only writable surfaces become the
+  # tmpfs mounts and the /profile + /work volumes, so a compromised page cannot
+  # persist anything to the image. Chromium still needs a writable HOME for its
+  # caches/locks outside the profile, so back it with tmpfs.
+  if [ "$READONLY" = "1" ]; then
+    HF+=( --read-only --tmpfs /home/sandbox:rw,nosuid,nodev,size=512m )
+  fi
+}
+
+parse_run_opts(){
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --observe) MODE="observe"; shift;;
+      --offline) NET="none"; shift;;
+      --allow) ALLOW="$2"; NET="allow"; shift 2;;
+      --work) WORK="$2"; shift 2;;
+      --profile) PROFILE_NAME="$2"; shift 2;;
+      --mem) MEM="$2"; shift 2;;
+      --cpus) CPUS="$2"; shift 2;;
+      --recipe) RECIPE="$2"; shift 2;;
+      --stealth) STEALTH="1"; shift;;
+      --camoufox) ENGINE="camoufox"; shift;;
+      --trace) TRACE="1"; shift;;
+      --har) HAR="1"; shift;;
+      --video) VIDEO="1"; shift;;
+      --readonly) READONLY="1"; shift;;
+      --circuit-breaker) CIRCUIT_BREAKER="1"; shift;;
+      *) die "unknown option: $1";;
+    esac
+  done
+}
+
+ensure_networks(){
+  docker network inspect "$NET_EXT" >/dev/null 2>&1 || docker network create "$NET_EXT" >/dev/null
+  docker network inspect "$NET_INT" >/dev/null 2>&1 || docker network create --internal "$NET_INT" >/dev/null
+}
+
+ensure_proxy(){
+  docker image inspect "$PROXY_IMAGE" >/dev/null 2>&1 || die "egress image missing — run: sandbox build"
+  ensure_networks
+  # (Re)create the proxy with the requested allow-list.
+  docker rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$PROXY_NAME" \
+    --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 \
+    --memory 128m --memory-swap 128m \
+    --network "$NET_EXT" -e SANDBOX_ALLOW="$ALLOW" "$PROXY_IMAGE" >/dev/null
+  docker network connect "$NET_INT" "$PROXY_NAME" >/dev/null
+}
+
+# FlareSolverr sidecar: a maintained Cloudflare/DDoS-Guard solver that runs its
+# own browser and returns the page HTML + clearance cookies. Reused across calls
+# (it caches sessions); torn down by `sandbox stop`. It must reach the internet,
+# so it runs on the default bridge with its port bound to localhost only. We keep
+# no-new-privileges + resource caps but NOT cap-drop ALL — its bundled browser
+# needs a few caps, and this is an upstream image whose whole job is egress.
+ensure_cf(){
+  have_docker
+  if docker ps --format '{{.Names}}' | grep -qx "$CF_NAME"; then return 0; fi
+  docker rm -f "$CF_NAME" >/dev/null 2>&1 || true
+  echo "[sandbox] starting FlareSolverr ($CF_IMAGE) ..." >&2
+  docker run -d --name "$CF_NAME" \
+    --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 \
+    --memory 1g --memory-swap 1g --shm-size 1g --cpus 2 \
+    -p 127.0.0.1:${CF_PORT}:8191 \
+    -e LOG_LEVEL=warning "$CF_IMAGE" >/dev/null
+  for _ in $(seq 1 60); do
+    curl -s "http://127.0.0.1:${CF_PORT}/" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  die "FlareSolverr did not become ready on :$CF_PORT — check: docker logs $CF_NAME"
+}
+
+# Resolve --recipe (path | inline JSON | '-') to a JSON string on stdout.
+resolve_recipe(){
+  [ -n "$RECIPE" ] || die "--recipe is required"
+  if [ "$RECIPE" = "-" ]; then cat
+  elif [ -f "$RECIPE" ]; then cat "$RECIPE"
+  else printf '%s' "$RECIPE"; fi
+}
+
+# Build the array of network + proxy args for a run.
+net_args(){
+  case "$NET" in
+    bridge) echo "--network bridge";;
+    none)   echo "--network none";;
+    allow)  ensure_proxy >&2; echo "--network $NET_INT --env SANDBOX_PROXY=http://$PROXY_NAME:8888";;
+    *) die "bad net mode";;
+  esac
+}
+
+cmd_build(){
+  have_docker
+  echo "[sandbox] building $IMAGE ..." >&2
+  docker build -t "$IMAGE" "$ROOT/docker"
+  echo "[sandbox] building $PROXY_IMAGE ..." >&2
+  docker build -t "$PROXY_IMAGE" "$ROOT/docker/egress"
+  docker volume inspect "$PROFILE_VOL" >/dev/null 2>&1 || docker volume create "$PROFILE_VOL" >/dev/null
+  echo "[sandbox] images ready." >&2
+}
+
+cmd_run(){
+  parse_run_opts "$@"
+  have_docker
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image missing — run: sandbox build"
+  docker volume inspect "$PROFILE_VOL" >/dev/null 2>&1 || docker volume create "$PROFILE_VOL" >/dev/null
+  if [ -z "$WORK" ]; then WORK="$(mktemp -d /tmp/sandbox-work.XXXXXX)"; fi
+  mkdir -p "$WORK"
+  local NA; NA="$(net_args)"
+  local PORTS=""
+  [ "$MODE" = "observe" ] && PORTS="-p 127.0.0.1:${NOVNC_PORT}:6080"
+  echo "[sandbox] run mode=$MODE net=$NET work=$WORK stealth=$STEALTH engine=${ENGINE:-chromium} circuit_breaker=$CIRCUIT_BREAKER" >&2
+  build_hard_flags
+  resolve_recipe | docker run -i --rm "${HF[@]}" $NA $PORTS \
+    -e MODE="$MODE" -e NOVNC_PORT="$NOVNC_PORT" -e SANDBOX_PROFILE="$PROFILE_NAME" \
+    -e SANDBOX_STEALTH="$STEALTH" -e SANDBOX_TRACE="$TRACE" \
+    -e SANDBOX_HAR="$HAR" -e SANDBOX_VIDEO="$VIDEO" -e SANDBOX_ENGINE="$ENGINE" \
+    -e SANDBOX_CIRCUIT_BREAKER="$CIRCUIT_BREAKER" \
+    -v "$PROFILE_VOL":/profile -v "$WORK":/work \
+    "$IMAGE" --recipe -
+}
+
+# LLM-driven mode: hand the container a natural-language goal and the browser-use
+# agent figures out the clicks itself. Credentials are passed by NAME (-e VAR) so
+# docker reads them from this shell at runtime — nothing secret touches a file.
+cmd_agent(){
+  local GOAL=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --observe) MODE="observe"; shift;;
+      --offline) NET="none"; shift;;
+      --allow) ALLOW="$2"; NET="allow"; shift 2;;
+      --work) WORK="$2"; shift 2;;
+      --profile) PROFILE_NAME="$2"; shift 2;;
+      --mem) MEM="$2"; shift 2;;
+      --cpus) CPUS="$2"; shift 2;;
+      --readonly) READONLY="1"; shift;;
+      --model) export SANDBOX_AGENT_MODEL="$2"; shift 2;;
+      --max-steps) export SANDBOX_AGENT_MAX_STEPS="$2"; shift 2;;
+      -*) die "unknown option for agent: $1";;
+      *) GOAL="$GOAL${GOAL:+ }$1"; shift;;
+    esac
+  done
+  [ -n "$GOAL" ] || die "agent: a goal is required, e.g. sandbox agent \"find the cheapest flight LHR->JFK in July\""
+  have_docker
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image missing — run: sandbox build"
+  docker volume inspect "$PROFILE_VOL" >/dev/null 2>&1 || docker volume create "$PROFILE_VOL" >/dev/null
+  if [ -z "${OPENAI_API_KEY:-}${OPENAI_BASE_URL:-}${ANTHROPIC_API_KEY:-}${GOOGLE_API_KEY:-}" ]; then
+    die "agent: no LLM key in env. Export OPENAI_API_KEY (+optional OPENAI_BASE_URL for any compatible endpoint), ANTHROPIC_API_KEY, or GOOGLE_API_KEY."
+  fi
+  if [ -z "$WORK" ]; then WORK="$(mktemp -d /tmp/sandbox-work.XXXXXX)"; fi
+  mkdir -p "$WORK"
+  local NA; NA="$(net_args)"
+  local PORTS=""
+  [ "$MODE" = "observe" ] && PORTS="-p 127.0.0.1:${NOVNC_PORT}:6080"
+  echo "[sandbox] agent mode=$MODE net=$NET work=$WORK" >&2
+  build_hard_flags
+  docker run -i --rm "${HF[@]}" $NA $PORTS \
+    -e RUNNER=agent -e MODE="$MODE" -e NOVNC_PORT="$NOVNC_PORT" -e SANDBOX_PROFILE="$PROFILE_NAME" \
+    -e OPENAI_API_KEY -e OPENAI_BASE_URL -e ANTHROPIC_API_KEY -e GOOGLE_API_KEY \
+    -e SANDBOX_AGENT_MODEL -e SANDBOX_AGENT_MAX_STEPS \
+    -v "$PROFILE_VOL":/profile -v "$WORK":/work \
+    "$IMAGE" "$GOAL"
+}
+
+# Fetch a Cloudflare/DDoS-Guard-protected URL through the FlareSolverr sidecar.
+# Prints a JSON summary (status, final url, cookies, html path) and writes the
+# cleared page HTML to <work>/cf-page.html.
+cmd_cf_get(){
+  local URL="" TIMEOUT="60000"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --work) WORK="$2"; shift 2;;
+      --max-timeout|--timeout) TIMEOUT="$2"; shift 2;;
+      -*) die "unknown option for cf-get: $1";;
+      *) URL="$1"; shift;;
+    esac
+  done
+  [ -n "$URL" ] || die "cf-get: a URL is required, e.g. sandbox cf-get https://example.com"
+  if [ -z "$WORK" ]; then WORK="$(mktemp -d /tmp/sandbox-work.XXXXXX)"; fi
+  mkdir -p "$WORK"
+  ensure_cf
+  echo "[sandbox] cf-get $URL (FlareSolverr on :$CF_PORT)" >&2
+  CF_URL="$URL" CF_TIMEOUT="$TIMEOUT" CF_PORT_ENV="$CF_PORT" CF_WORK="$WORK" python3 - <<'PY'
+import json, os, urllib.request
+endpoint = "http://127.0.0.1:%s/v1" % os.environ["CF_PORT_ENV"]
+body = json.dumps({"cmd": "request.get", "url": os.environ["CF_URL"],
+                   "maxTimeout": int(os.environ["CF_TIMEOUT"])}).encode()
+req = urllib.request.Request(endpoint, data=body,
+                             headers={"Content-Type": "application/json"})
+try:
+    raw = urllib.request.urlopen(req, timeout=int(os.environ["CF_TIMEOUT"]) / 1000 + 30).read()
+    data = json.loads(raw)
+except Exception as e:  # noqa: BLE001
+    print(json.dumps({"ok": False, "error": "flaresolverr request failed: %s" % e}))
+    raise SystemExit(1)
+sol = data.get("solution", {})
+htmlpath = os.path.join(os.environ["CF_WORK"], "cf-page.html")
+with open(htmlpath, "w", encoding="utf-8") as fh:
+    fh.write(sol.get("response", "") or "")
+print(json.dumps({"ok": data.get("status") == "ok", "status": data.get("status"),
+                  "message": data.get("message"), "url": sol.get("url"),
+                  "user_agent": sol.get("userAgent"), "cookies": sol.get("cookies", []),
+                  "html": htmlpath}))
+PY
+}
+
+# Convert a document to Markdown with markitdown, fully inside the hardened
+# container (offline, no cloud API). The file's host directory is mounted at
+# /work and the .md is written back beside the source. Supports PDF, DOCX, PPTX,
+# XLSX, HTML, CSV, JSON, XML, EPub, and images. Output: one JSON line
+# {ok,file,out,chars,markdown}.
+cmd_convert(){
+  local FILE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mem) MEM="$2"; shift 2;;
+      --cpus) CPUS="$2"; shift 2;;
+      -*) die "unknown option for convert: $1";;
+      *) FILE="$1"; shift;;
+    esac
+  done
+  [ -n "$FILE" ] || die "convert: a file is required, e.g. sandbox convert report.pdf"
+  [ -f "$FILE" ] || die "convert: no such file: $FILE"
+  have_docker
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image missing — run: sandbox build"
+  local DIR BASE
+  DIR="$(cd "$(dirname "$FILE")" && pwd)"
+  BASE="$(basename "$FILE")"
+  echo "[sandbox] convert $BASE (markitdown, offline)" >&2
+  build_hard_flags
+  # No browser, no profile, no network: a pure local file->markdown transform.
+  docker run --rm "${HF[@]}" --network none \
+    -e RUNNER=convert -e WORK_DIR=/work -e CONVERT_FILE="$BASE" \
+    -v "$DIR":/work \
+    "$IMAGE"
+}
+
+# Fetch audio/video (or metadata/subtitles only) from a URL via yt-dlp, fully
+# inside the hardened container. Respects the tinyproxy egress allow-list so the
+# download boundary matches any other sandbox call. Output: one JSON line
+# {ok,url,title,format,file,subtitles_path,metadata_path,error}. Files land in
+# --work (default: a fresh mktemp dir).
+cmd_fetch_media(){
+  local URL="" MEDIA_FMT="best" WRITE_AUTO_SUBS="0" SKIP_DOWNLOAD="0"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --work) WORK="$2"; shift 2;;
+      --offline) NET="none"; shift;;
+      --allow) ALLOW="$2"; NET="allow"; shift 2;;
+      --mem) MEM="$2"; shift 2;;
+      --cpus) CPUS="$2"; shift 2;;
+      --format) MEDIA_FMT="$2"; shift 2;;
+      --write-auto-subs) WRITE_AUTO_SUBS="1"; shift;;
+      --skip-download) SKIP_DOWNLOAD="1"; shift;;
+      -*) die "unknown option for fetch-media: $1";;
+      *) URL="$1"; shift;;
+    esac
+  done
+  [ -n "$URL" ] || die "fetch-media: a URL is required, e.g. sandbox fetch-media https://youtu.be/dQw4w9WgXcQ"
+  have_docker
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image missing — run: sandbox build"
+  if [ -z "$WORK" ]; then WORK="$(mktemp -d /tmp/sandbox-media.XXXXXX)"; fi
+  mkdir -p "$WORK"
+  local NA; NA="$(net_args)"
+  echo "[sandbox] fetch-media format=$MEDIA_FMT skip_download=$SKIP_DOWNLOAD net=$NET work=$WORK" >&2
+  build_hard_flags
+  # No browser, no display, no profile volume: a pure network->file transform.
+  docker run --rm "${HF[@]}" $NA \
+    -e RUNNER=media -e WORK_DIR=/work \
+    -e MEDIA_URL="$URL" \
+    -e MEDIA_FORMAT="$MEDIA_FMT" \
+    -e MEDIA_WRITE_AUTO_SUBS="$WRITE_AUTO_SUBS" \
+    -e MEDIA_SKIP_DOWNLOAD="$SKIP_DOWNLOAD" \
+    -v "$WORK":/work \
+    "$IMAGE"
+}
+
+# curl_cffi browser-impersonation fetch (its own venv). A non-browser HTTP(S)
+# client that mimics a real browser's TLS/JA3 + HTTP/2 fingerprint -- lighter than
+# Chromium, higher fidelity than raw requests. Honors --allow/--offline like every
+# other runner. Repeatable --header K:V flags accumulate (comma-joined for the env).
+cmd_fetch_impersonate(){
+  local URL="" IMPERSONATE="chrome120" METHOD="GET" HEADERS="" BODY="" TIMEOUT="30"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --work) WORK="$2"; shift 2;;
+      --offline) NET="none"; shift;;
+      --allow) ALLOW="$2"; NET="allow"; shift 2;;
+      --mem) MEM="$2"; shift 2;;
+      --cpus) CPUS="$2"; shift 2;;
+      --impersonate) IMPERSONATE="$2"; shift 2;;
+      --method) METHOD="$2"; shift 2;;
+      --header) HEADERS="${HEADERS:+$HEADERS,}$2"; shift 2;;
+      --body) BODY="$2"; shift 2;;
+      --timeout) TIMEOUT="$2"; shift 2;;
+      -*) die "unknown option for fetch-impersonate: $1";;
+      *) URL="$1"; shift;;
+    esac
+  done
+  [ -n "$URL" ] || die "fetch-impersonate: a URL is required, e.g. sandbox fetch-impersonate https://example.com"
+  have_docker
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image missing — run: sandbox build"
+  if [ -z "$WORK" ]; then WORK="$(mktemp -d /tmp/sandbox-http.XXXXXX)"; fi
+  mkdir -p "$WORK"
+  local NA; NA="$(net_args)"
+  echo "[sandbox] fetch-impersonate impersonate=$IMPERSONATE method=$METHOD net=$NET work=$WORK" >&2
+  build_hard_flags
+  docker run --rm "${HF[@]}" $NA \
+    -e RUNNER=http -e WORK_DIR=/work \
+    -e HTTP_URL="$URL" \
+    -e HTTP_IMPERSONATE="$IMPERSONATE" \
+    -e HTTP_METHOD="$METHOD" \
+    -e HTTP_HEADERS="$HEADERS" \
+    -e HTTP_BODY="$BODY" \
+    -e HTTP_TIMEOUT="$TIMEOUT" \
+    -v "$WORK":/work \
+    "$IMAGE"
+}
+
+# vegeta HTTP load test (driver venv interpreter, in-image vegeta binary). Fires a
+# constant-rate request stream at a single URL and reports latency percentiles,
+# throughput, and the status-code distribution. Honors --allow/--offline.
+cmd_load(){
+  local URL="" RATE="10" DURATION="10" METHOD="GET"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --work) WORK="$2"; shift 2;;
+      --offline) NET="none"; shift;;
+      --allow) ALLOW="$2"; NET="allow"; shift 2;;
+      --mem) MEM="$2"; shift 2;;
+      --cpus) CPUS="$2"; shift 2;;
+      --rate) RATE="$2"; shift 2;;
+      --duration) DURATION="$2"; shift 2;;
+      --method) METHOD="$2"; shift 2;;
+      -*) die "unknown option for load: $1";;
+      *) URL="$1"; shift;;
+    esac
+  done
+  [ -n "$URL" ] || die "load: a URL is required, e.g. sandbox load --rate 20 --duration 10 https://example.com"
+  have_docker
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image missing — run: sandbox build"
+  if [ -z "$WORK" ]; then WORK="$(mktemp -d /tmp/sandbox-load.XXXXXX)"; fi
+  mkdir -p "$WORK"
+  local NA; NA="$(net_args)"
+  echo "[sandbox] load rate=$RATE duration=${DURATION}s method=$METHOD net=$NET work=$WORK" >&2
+  build_hard_flags
+  docker run --rm "${HF[@]}" $NA \
+    -e RUNNER=load -e WORK_DIR=/work \
+    -e LOAD_URL="$URL" \
+    -e LOAD_RATE="$RATE" \
+    -e LOAD_DURATION="$DURATION" \
+    -e LOAD_METHOD="$METHOD" \
+    -v "$WORK":/work \
+    "$IMAGE"
+}
+
+# Trafilatura feed/sitemap discovery and focused spider (no browser required).
+# Builds a minimal recipe with the requested op(s) and delegates to cmd_run.
+# Supported --op values: feeds (default), sitemaps, crawl.
+# Output: JSON from driver.py with extracted URLs in .extracted.<op_0>.
+cmd_spider(){
+  local URL="" OP="feeds" MAX_PAGES="50"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --op)       OP="$2"; shift 2;;
+      --max-pages) MAX_PAGES="$2"; shift 2;;
+      --allow)    ALLOW="$2"; NET="allow"; shift 2;;
+      --offline)  NET="none"; shift;;
+      --work)     WORK="$2"; shift 2;;
+      --mem)      MEM="$2"; shift 2;;
+      --cpus)     CPUS="$2"; shift 2;;
+      --stealth)  STEALTH="1"; shift;;
+      -*) die "unknown option for spider: $1";;
+      *) URL="$1"; shift;;
+    esac
+  done
+  [ -n "$URL" ] || die "spider: a URL is required, e.g. sandbox spider https://example.com"
+  case "$OP" in
+    feeds)    local RECIPE_OP="discover_feeds";;
+    sitemaps) local RECIPE_OP="discover_sitemaps";;
+    crawl)    local RECIPE_OP="spider_crawl";;
+    *) die "spider: --op must be feeds, sitemaps, or crawl (got: $OP)";;
+  esac
+  echo "[sandbox] spider op=$OP url=$URL max_pages=$MAX_PAGES" >&2
+  case "$MAX_PAGES" in (''|*[!0-9]*) die "spider: --max-pages must be a positive integer (got: $MAX_PAGES)";; esac
+  # Build a minimal recipe: just navigate + the trafilatura op (no browser needed
+  # for feeds/sitemaps, but a navigate is harmless and keeps the run() loop stable).
+  # Compose via python3 (already a dependency, see cf-get) with the URL passed as
+  # an env var, so a URL containing quotes or backslashes can never break the JSON.
+  local REC
+  REC=$(SPIDER_URL="$URL" SPIDER_OP="$RECIPE_OP" SPIDER_MP="$MAX_PAGES" python3 - <<'PY'
+import json, os
+u = os.environ["SPIDER_URL"]
+print(json.dumps({"steps": [
+    {"op": "navigate", "url": u},
+    {"op": os.environ["SPIDER_OP"], "name": "result", "url": u,
+     "max_pages": int(os.environ["SPIDER_MP"])},
+]}))
+PY
+) || die "spider: failed to build recipe"
+  RECIPE="$REC"
+  cmd_run
+}
+
+cmd_observe(){
+  parse_run_opts "$@"
+  have_docker
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image missing — run: sandbox build"
+  docker rm -f "$OBSERVE_NAME" >/dev/null 2>&1 || true
+  local NA; NA="$(net_args)"
+  build_hard_flags
+  # Long-lived observe container: start the virtual-display + VNC stack and hold
+  # open a blank chromium so a human can log in / watch at the noVNC URL.
+  docker run -d --name "$OBSERVE_NAME" "${HF[@]}" $NA \
+    -p 127.0.0.1:${NOVNC_PORT}:6080 -e MODE=observe -e SANDBOX_PROFILE="$PROFILE_NAME" \
+    -v "$PROFILE_VOL":/profile --entrypoint /bin/bash "$IMAGE" \
+    -lc 'P=/profile/${SANDBOX_PROFILE:-default}; mkdir -p "$P"; rm -f "$P"/Singleton*; Xvfb :99 -screen 0 1280x800x24 -nolisten tcp & sleep 1; fluxbox >/dev/null 2>&1 & x11vnc -display :99 -forever -shared -nopw -quiet -rfbport 5900 >/dev/null 2>&1 & websockify --web /usr/share/novnc 6080 localhost:5900 >/dev/null 2>&1 & chromium --no-sandbox --user-data-dir="$P" about:blank >/dev/null 2>&1 & wait' >/dev/null
+  echo "[sandbox] observe up — open http://localhost:${NOVNC_PORT}/vnc.html"
+  echo "[sandbox] stop with: sandbox stop"
+}
+
+cmd_shell(){
+  parse_run_opts "$@"
+  have_docker
+  build_hard_flags
+  local NA; NA="$(net_args)"
+  docker run -it --rm "${HF[@]}" $NA -e MODE=headless \
+    -v "$PROFILE_VOL":/profile --entrypoint /bin/bash "$IMAGE"
+}
+
+cmd_stop(){
+  docker rm -f "$OBSERVE_NAME" "$PROXY_NAME" "$CF_NAME" >/dev/null 2>&1 || true
+  docker network rm "$NET_INT" "$NET_EXT" >/dev/null 2>&1 || true
+  echo "[sandbox] torn down."
+}
+
+cmd_doctor(){
+  echo "docker:   $(docker info >/dev/null 2>&1 && echo UP || echo DOWN)"
+  echo "image:    $(docker image inspect "$IMAGE" >/dev/null 2>&1 && echo present || echo MISSING)"
+  echo "proxy:    $(docker image inspect "$PROXY_IMAGE" >/dev/null 2>&1 && echo present || echo MISSING)"
+  echo "profile:  $(docker volume inspect "$PROFILE_VOL" >/dev/null 2>&1 && echo present || echo MISSING)"
+  echo "cf:       $(docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CF_NAME" && echo running || echo stopped) ($CF_IMAGE)"
+  echo "tart:     $(command -v tart >/dev/null 2>&1 && tart --version || echo MISSING)"
+}
+
+# Run hadolint (ghcr.io/hadolint/hadolint:v2.12.0) against every Dockerfile in
+# $ROOT/docker. The binary runs in its own throw-away container — nothing is
+# installed into the sandbox image. Output is forwarded verbatim; exit code
+# mirrors hadolint's (0 = clean, 1 = violations). The image's default command is
+# `hadolint -` (read the Dockerfile from stdin), so we redirect it in and pass NO
+# extra arg. Rule suppressions live in .hadolint.yaml at the sandbox root,
+# mounted at /.hadolint.yaml (hadolint's working dir) so `ignored:` is honoured.
+HADOLINT_IMAGE="ghcr.io/hadolint/hadolint:v2.12.0"
+cmd_lint_dockerfile(){
+  have_docker
+  local CFG_VOL=()
+  local CFG_FILE="$ROOT/.hadolint.yaml"
+  [ -f "$CFG_FILE" ] && CFG_VOL=(-v "$CFG_FILE:/.hadolint.yaml:ro")
+  local FAIL=0
+  for DF in "$ROOT/docker/Dockerfile" "$ROOT/docker/egress/Dockerfile"; do
+    [ -f "$DF" ] || continue
+    local REL="${DF#$ROOT/}"
+    echo "[sandbox] hadolint $REL" >&2
+    docker run --rm -i \
+      "${CFG_VOL[@]+"${CFG_VOL[@]}"}" \
+      "$HADOLINT_IMAGE" < "$DF" || FAIL=1
+  done
+  return "$FAIL"
+}
+
+case "${1:-}" in
+  build)   shift; cmd_build "$@";;
+  run)     shift; cmd_run "$@";;
+  agent)   shift; cmd_agent "$@";;
+  cf-get)       shift; cmd_cf_get "$@";;
+  convert)      shift; cmd_convert "$@";;
+  fetch-media)  shift; cmd_fetch_media "$@";;
+  fetch-impersonate) shift; cmd_fetch_impersonate "$@";;
+  load)         shift; cmd_load "$@";;
+  spider)       shift; cmd_spider "$@";;
+  observe) shift; cmd_observe "$@";;
+  shell)   shift; cmd_shell "$@";;
+  stop|down) shift; cmd_stop "$@";;
+  doctor)  shift; cmd_doctor "$@";;
+  lint-dockerfile) shift; cmd_lint_dockerfile "$@";;
+  vm)      shift; exec "$ROOT/vm/tart.sh" "$@";;
+  *) grep -E '^#( |$)' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1;;
+esac

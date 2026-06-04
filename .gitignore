@@ -1,0 +1,14 @@
+# Internal planning catalog — not part of the published project
+docs/capability-audit-2026-06.md
+
+# OS / editor junk
+.DS_Store
+*.swp
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Run artifacts (the sandbox writes screenshots, traces, HAR, video, and
+# downloads into a --work dir; the repo root is the default)
+/work/
